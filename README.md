@@ -23,6 +23,14 @@ curl -LsS https://raw.githubusercontent.com/89622180/cmp170hx-check/main/run.sh 
 curl -LsS https://raw.githubusercontent.com/89622180/cmp170hx-check/main/run.sh | sudo bash -s -- --bdf 0000:01:00.0 --smi
 ```
 
+如果这台机器到 `raw.githubusercontent.com` 不通（CN 网络常见），换 jsdelivr CDN 镜像，行为完全一样：
+
+```bash
+curl -LsS https://cdn.jsdelivr.net/gh/89622180/cmp170hx-check@main/run.sh | sudo bash
+```
+
+`run.sh` 自己也带这个回退：先试 GitHub raw，拉不到就自动改用 jsdelivr，你不用管。
+
 ## 全自动都做了什么
 
 `run.sh` 依次做四步，任何一步失败就停下并说明原因：
