@@ -23,7 +23,7 @@ REPO="cmp170hx-check"
 RAW_URL="https://raw.githubusercontent.com/${OWNER}/${REPO}/main/cmp170hx_check.py"
 CDN_URL="https://cdn.jsdelivr.net/gh/${OWNER}/${REPO}@main/cmp170hx_check.py"
 # 期望的 sha256（当前发布版本）。不一致只警告、不阻断，方便你自己换分支/本地改版。
-EXPECTED_SHA256="3d0899fde9ef9cd3902b1b7801364ebb545007b8b10f1974680c10ec4751ce30"
+EXPECTED_SHA256="9c08dcaaccaab8d5ef4c082c16f65696397c18c01cf088601521e4a6ffac26e9"
 
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then

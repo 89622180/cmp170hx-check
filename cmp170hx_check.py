@@ -30,6 +30,15 @@
 
 偏移交叉核对来源：GA100 dev_fuse.h、https://github.com/matstatman/gpcprobe（2026-10-18 复核）
 sysfs 访问路径：https://docs.kernel.org/PCI/sysfs-pci.html
+
+v2026-11-15 修正（对照 https://arca.live/b/aihomelab/186266420 的 2026-10-18 回帖）：
+  1) 显存基准改成 4 GiB / FBPA（驱动实测 64 GiB ÷ 16 个活跃 FBPA），
+     旧版用"24 FBPA = 80 GiB"会把现役 16 分区的卡算成 53.3 GiB，与 nvidia-smi 对不上。
+  2) "关掉的 8 个 FBPA = 两整条 HBM 栈"这个分组是错的：按 gpcprobe 的映射，
+     位点 s = FBPA 4s..4s+3，关掉的 {2,3,8,9,12,13,22,23} 散在四个位点里、每位点占一半。
+  3) SM 上限同时给出两种口径（按 GPC 父位 / 按挂缺陷 TPC 计数），两者不一致会明确提示。
+  4) 显存物理天花板 = 板载 HBM 颗粒数，寄存器读不出来，不再假装能算。
+  5) 删掉"顶级/良好/一般"这种社区档位标签——样本本身就从 108 散到 126，贴标签没信息量。
 """
 
 import argparse
@@ -48,7 +57,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "2026-11-14.ubuntu.1"
+VERSION = "2026-11-15.ubuntu.2"
 
 SUPPORTED_DEVICES = {0x20C2: "CMP 170HX 8GB SKU", 0x2082: "CMP 170HX 10GB SKU"}
 VENDOR_NVIDIA = 0x10DE
@@ -64,9 +73,20 @@ TOTAL_SM = GPC_COUNT * SM_PER_GPC              # 128
 FULL_FBP = 12
 FULL_FBPA = 24
 FULL_FBIO = 24
-# 满配折算基准：社区口径 GA100 全 24 个 FBPA 对应 80 GiB。
-# 这是"按缺陷标记折算的估算"，不是实测容量；板载 HBM 颗粒容量才是真实上限。
-FULL_VRAM_GIB = 80.0
+# GA100 的 HBM 位点是 6 个，每个逻辑位点 s 带 FBPA 4s..4s+3；一个 FBP 带 2 个 FBPA
+# （FBP i ↔ FBPA 2i、2i+1）。映射来源：
+#   https://github.com/matstatman/gpcprobe/blob/master/gpc_probe.py
+#   https://arca.live/b/aihomelab/186266420（2026-10-18 回帖纠正了"关掉的 8 个 FBPA
+#   等于两整栈"这个分组：它们其实散在四个位点里，每位点半份）
+FBPA_PER_SITE = 4
+HBM_SITES = FULL_FBPA // FBPA_PER_SITE     # 6
+FBPA_PER_FBP = 2
+# 每 FBPA 的折算基准。GA100 满配 HBM2e 单栈 16 GiB、每栈 4 个 FBPA ⇒ 4 GiB / FBPA。
+# 老版本这里写的是"全 24 FBPA = 80 GiB"（=3.33 GiB/FBPA），会把现役 16 FBPA 的卡
+# 报成 53.3 GiB，而驱动实测是 64 GiB —— 那个基准是错的，已按实测口径改掉。
+PER_FBPA_GIB = 4.0
+# 板载 HBM 颗粒数量才是真上限：寄存器只能告诉你哪个分区死了，不能告诉你哪一栈有颗粒。
+# 社区实测口径（同帖回帖，2026-10-18）：只焊 4 颗 ⇒ 64 GiB 封顶，fuse 全开也变不出颗粒。
 
 # (name, BAR0 byte offset, accepted low-bit width). NO command/data ports.
 REGISTERS = (
@@ -360,6 +380,9 @@ def interpret(values):
             "fuse_disabled_mask": fmt_mask(disabled, width),
             "defective_mask": fmt_mask(defective, width),
             "effective_mask": fmt_mask(effective, width),
+            "fuse_disabled_mask_int": disabled,
+            "defective_mask_int": defective,
+            "effective_mask_int": effective,
             "ctrl_opt_raw": fmt_mask(values["CTRL_OPT_%s" % group], 32),
             "fuse_disabled_indices": bit_indices(disabled, width),
             "defect_marked_indices": bit_indices(defective, width),
@@ -422,6 +445,11 @@ def interpret(values):
             defect_sm += popcount(defective) * SM_PER_TPC
         result["tpc_per_gpc"].append(row)
 
+    # 第二种口径（与 arca.live 帖子一致）：只数"挂了缺陷标记的 TPC"，
+    # 上限 = (64 − 标坏 TPC 数) × 2。和上面按 GPC 父位整组扣的算法应当一致；
+    # 不一致就说明 GPC 父位与 TPC 子位对不上，值得在报告里点出来。
+    defect_tpc_marked = sum(popcount(values["OPT_TPC_GPC%d_DEFECTIVE" % gpc])
+                            for gpc in range(GPC_COUNT))
     result["sm"] = {
         "total_sm_on_die": TOTAL_SM,
         "effective_sm": eff_sm,
@@ -431,20 +459,73 @@ def interpret(values):
         "defect_stuck_sm": defect_sm,
         "upper_bound_sm": eff_sm + rec_sm,
         "checked_sum_equals_die_total": (eff_sm + rec_sm + defect_sm) == TOTAL_SM,
+        "defect_marked_tpc_total": defect_tpc_marked,
+        "defect_marked_tpc_total_per_gpc": [
+            popcount(values["OPT_TPC_GPC%d_DEFECTIVE" % gpc]) for gpc in range(GPC_COUNT)],
+        "defect_based_ceiling_sm": (TOTAL_SM // SM_PER_TPC - defect_tpc_marked) * SM_PER_TPC,
+        "both_ceiling_methods_agree": (
+            (TOTAL_SM // SM_PER_TPC - defect_tpc_marked) * SM_PER_TPC) == (eff_sm + rec_sm),
     }
 
     # ---- 显存通路 ----
     fbpa = result["groups"]["FBPA"]
     fbp = result["groups"]["FBP"]
     fbpa_on = fbpa["effective_enabled_count"]
+    clean_off = bit_indices(fbpa["fuse_disabled_mask_int"] & ~fbpa["defective_mask_int"],
+                            FULL_FBPA)
+    defect_on = bit_indices(fbpa["defective_mask_int"], FULL_FBPA)
+
+    # 逻辑 HBM 位点：位点 s = FBPA 4s..4s+3（gpcprobe 的映射）。
+    # "关掉的 FBPA = 两整栈"是错的；它们散在四个位点里、每位点半份。
+    sites = []
+    for site in range(HBM_SITES):
+        lo = site * FBPA_PER_SITE
+        rng = range(lo, lo + FBPA_PER_SITE)
+        site_on = [i for i in rng if not (fbpa["effective_mask_int"] >> i) & 1]
+        sites.append({
+            "site": site,
+            "fbpa_range": "%d-%d" % (lo, lo + FBPA_PER_SITE - 1),
+            "enabled_count": len(site_on),
+            "clean_disabled": [i for i in rng if i in clean_off],
+            "defect_marked": [i for i in rng if i in defect_on],
+            "whole_stack_off": len(site_on) == 0,
+        })
+
+    # FBP i 带 FBPA 2i、2i+1：把 FBP 掩码展开后应与 FBPA 掩码逐位相等。
+    # 这是唯一一个能在这台机器上自证"位点映射"的交叉核对，所以每次都算一遍。
+    def expand_fbp(mask):
+        out = 0
+        for i in range(FULL_FBP):
+            if mask & (1 << i):
+                out |= 1 << (FBPA_PER_FBP * i)
+                out |= 1 << (FBPA_PER_FBP * i + 1)
+        return out
+
+    fbp_expanded = expand_fbp(fbp["effective_mask_int"])
+    map_ok = fbp_expanded == fbpa["effective_mask_int"]
+    map_ok_defect = expand_fbp(fbp["defective_mask_int"]) == fbpa["defective_mask_int"]
+
     result["vram"] = {
         "fbp_enabled": fbp["effective_enabled_count"], "fbp_total": FULL_FBP,
+        "fbp_to_fbpa_map": "FBP i -> FBPA 2i, 2i+1",
+        "fbp_mask_expanded_to_fbpa": fmt_mask(fbp_expanded, FULL_FBPA),
+        "fbpa_mask_matches_expanded_fbp": map_ok,
+        "fbpa_defect_mask_matches_expanded_fbp": map_ok_defect,
         "fbpa_enabled": fbpa_on, "fbpa_total": FULL_FBPA,
+        "fbpa_clean_disabled": clean_off,
+        "fbpa_defect_marked": defect_on,
         "fbio_enabled": result["groups"]["FBIO"]["effective_enabled_count"],
         "fbio_total": FULL_FBIO,
-        "assumed_full_vram_gib": FULL_VRAM_GIB,
-        "estimated_fraction": round(float(fbpa_on) / FULL_FBPA, 4),
-        "estimated_capacity_gib": round(FULL_VRAM_GIB * fbpa_on / FULL_FBPA, 1),
+        "hbm_sites": HBM_SITES, "fbpa_per_site": FBPA_PER_SITE,
+        "site_breakdown": sites,
+        "per_fbpa_gib_assumed": PER_FBPA_GIB,
+        "active_partitions_gib": round(fbpa_on * PER_FBPA_GIB, 1),
+        "logic_ceiling_gib": round((fbpa_on + len(clean_off)) * PER_FBPA_GIB, 1),
+        "logic_ceiling_partitions": fbpa_on + len(clean_off),
+        # 寄存器只告诉你哪个分区被关/被标坏，告诉不了你那个分区背后到底焊没焊颗粒。
+        # 板载 HBM 颗粒数才是硬上限；fuse 全开也变出不存在的颗粒。
+        "physical_ceiling_gib": None,
+        "physical_ceiling_note": "板载 HBM 颗粒数决定，BAR0 寄存器读不出来（需拆卡/查 BOM）。",
     }
     return result
 
@@ -476,6 +557,7 @@ def new_report(target):
             "掩码是配置/缺陷标记的记录，不是健康度测试。",
             "本脚本没有启用、也没有实测任何隐藏显存或停用 SM。",
             "SM / 显存数字是按缺陷标记折算的估算，不是实测上限。",
+            "显存的物理天花板由板载 HBM 颗粒数决定，BAR0 读不出来。",
             "现有 NVIDIA 驱动可能独立于本脚本自行动作。",
         ],
     }
@@ -647,16 +729,14 @@ def supervise(target, verbose=True):
 
 # ---------------------------------------------------------------- 中文报告
 
-def verdict(upper_sm):
-    if upper_sm >= 124:
-        return "顶级", "满血潜力，接近 63 TPC / 126 SM 那档"
-    if upper_sm >= 118:
-        return "良好", "可救空间大，值得按 die 逐卡定制烧写"
-    if upper_sm >= 110:
-        return "中上", "略高于社区常见档位，可救部分明确"
-    if upper_sm >= 100:
-        return "一般", "社区样本的主流区间下沿"
-    return "偏弱", "可救部分少，性价比一般"
+def verdict(sm):
+    """不评档：社区样本本身就从 108 散到 126，贴标签没有信息量。
+    这里只把"这个上限是怎么来的"写成一行可核对的话。"""
+    upper = sm.get("upper_bound_sm", 0)
+    recover = sm.get("recoverable_sm", 0)
+    stuck = sm.get("defect_stuck_sm", 0)
+    return ("现役 %d + 仅禁未标坏 %d = %d SM；另有 %d SM 挂缺陷标记不可用"
+            % (sm.get("effective_sm", 0), recover, upper, stuck))
 
 
 ERROR_HINTS = (
@@ -752,8 +832,13 @@ def render_card(report, index, total, show_regs=False):
     out.append("  " + pad("缺陷挂账 SM", 14, ">") + " : %-4d (挂牌缺陷，硬不可用)" % sm.get("defect_stuck_sm", 0))
     out.append("  " + pad("上限估算 SM", 14, ">") + " : %-4d ← 全开后估算 / die 满配 %d"
                % (sm.get("upper_bound_sm", 0), sm.get("total_sm_on_die", TOTAL_SM)))
-    tag, why = verdict(sm.get("upper_bound_sm", 0))
-    out.append("  " + pad("档位", 14, ">") + " : %s —— %s" % (tag, why))
+    if sm.get("defect_based_ceiling_sm") is not None:
+        out.append("  " + pad("按标坏 TPC 算", 14, ">")
+                   + " : %-4d ← (64 − %d 个挂缺陷 TPC) × 2   [%s]"
+                   % (sm.get("defect_based_ceiling_sm", 0),
+                      sm.get("defect_marked_tpc_total", 0),
+                      "与上行一致" if sm.get("both_ceiling_methods_agree") else "与上行不一致，检查父位/子位"))
+    out.append("  " + pad("口径", 14, ">") + " : %s" % verdict(sm))
     out.append("")
 
     # ---- 显存通路 ----
@@ -763,9 +848,35 @@ def render_card(report, index, total, show_regs=False):
         out.append("  " + pad(group, 6) + " 启用 %2d/%d" % (g["effective_enabled_count"], width)
                    + "   仅禁用 %s" % pad(fmt_bits(g["disabled_without_defect_flag"]), 18)
                    + "  标坏 %s" % fmt_bits(g["defect_marked_indices"]))
-    out.append("  折算上限 : ≈ %.1f GiB（按 %d 份满配 %.0f GiB 折算，仅供参考；"
-               "真实可用容量受板载 HBM 颗粒限制）"
-               % (vram.get("estimated_capacity_gib", 0), FULL_FBPA, FULL_VRAM_GIB))
+
+    sites = vram.get("site_breakdown") or []
+    if vram.get("fbpa_mask_matches_expanded_fbp") is not None:
+        out.append("  映射核对 : FBP 掩码按 i→2i,2i+1 展开 = %s，与 FBPA 生效掩码%s；"
+                   "缺陷掩码%s"
+                   % (vram.get("fbp_mask_expanded_to_fbpa", "?"),
+                      "一致" if vram.get("fbpa_mask_matches_expanded_fbp") else "不一致",
+                      "也一致" if vram.get("fbpa_defect_mask_matches_expanded_fbp") else "不一致"))
+    if sites:
+        out.append("  HBM 位点（位点 s = FBPA 4s..4s+3；每 FBPA 折算 %.0f GiB）"
+                   % vram.get("per_fbpa_gib_assumed", PER_FBPA_GIB))
+        out.append("  " + pad("位点", 6) + pad("FBPA", 9) + pad("在位", 8)
+                   + pad("仅关未标坏", 16) + pad("标坏", 16) + " 整栈")
+        for s in sites:
+            out.append("  " + pad(str(s["site"]), 6) + pad(s["fbpa_range"], 9)
+                       + pad("%d/%d" % (s["enabled_count"], vram.get("fbpa_per_site", FBPA_PER_SITE)), 8)
+                       + pad(fmt_bits(s["clean_disabled"]), 16)
+                       + pad(fmt_bits(s["defect_marked"]), 16)
+                       + (" 整栈灭" if s["whole_stack_off"] else " -"))
+    out.append("  现役容量 : %d/24 分区 × %.0f GiB = %.1f GiB"
+               % (vram.get("fbpa_enabled", 0), vram.get("per_fbpa_gib_assumed", PER_FBPA_GIB),
+                  vram.get("active_partitions_gib", 0.0)))
+    out.append("  逻辑上限 : %d/24 分区 × %.0f GiB = %.1f GiB（把\"仅关但未标坏\"的 %d 个分区算进去；"
+               % (vram.get("logic_ceiling_partitions", 0),
+                  vram.get("per_fbpa_gib_assumed", PER_FBPA_GIB),
+                  vram.get("logic_ceiling_gib", 0.0),
+                  len(vram.get("fbpa_clean_disabled") or [])))
+    out.append("             条件性候选，不是实测值）")
+    out.append("  物理上限 : 读不出来 —— %s" % vram.get("physical_ceiling_note", ""))
     out.append("")
 
     # ---- 开关门 / 一致性 ----
@@ -795,27 +906,32 @@ def render_card(report, index, total, show_regs=False):
 
 
 def render_summary(reports):
-    out = ["", "═" * 78, " 全卡汇总（上限 = 现役 + 可救，按缺陷标记折算）", "═" * 78]
+    out = ["", "═" * 92, " 全卡汇总（SM 上限 = 现役 + 可救；显存按 4 GiB/FBPA 折算；全部按缺陷标记推，非实测）",
+           "═" * 92]
     out.append("  " + pad("#", 3) + pad("BDF", 15) + pad("SKU", 21)
                + pad("现役SM", 8, ">") + pad("可救SM", 8, ">") + pad("上限", 7, ">")
-               + pad("缺陷", 6, ">") + "  档位")
+               + pad("缺陷", 6, ">") + pad("现役GiB", 9, ">") + pad("逻辑上限GiB", 13, ">"))
     ok = 0
     for i, rep in enumerate(reports):
         t = rep.get("target") or {}
         if rep.get("error"):
             out.append("  " + pad(str(i), 3) + pad(t.get("bdf", "?"), 15)
                        + pad("读取失败", 21) + pad("-", 8, ">") + pad("-", 8, ">")
-                       + pad("-", 7, ">") + pad("-", 6, ">") + "  见上文")
+                       + pad("-", 7, ">") + pad("-", 6, ">") + pad("-", 9, ">")
+                       + pad("-", 13, ">") + "  见上文")
             continue
         ok += 1
-        sm = (rep.get("interpretation") or {}).get("sm") or {}
-        tag, _ = verdict(sm.get("upper_bound_sm", 0))
+        interp = rep.get("interpretation") or {}
+        sm = interp.get("sm") or {}
+        vram = interp.get("vram") or {}
         out.append("  " + pad(str(i), 3) + pad(t.get("bdf", "?"), 15)
                    + pad(t.get("sku", ""), 21)
                    + pad(str(sm.get("effective_sm", 0)), 8, ">")
                    + pad(str(sm.get("recoverable_sm", 0)), 8, ">")
                    + pad(str(sm.get("upper_bound_sm", 0)), 7, ">")
-                   + pad(str(sm.get("defect_stuck_sm", 0)), 6, ">") + "  " + tag)
+                   + pad(str(sm.get("defect_stuck_sm", 0)), 6, ">")
+                   + pad("%.0f" % vram.get("active_partitions_gib", 0.0), 9, ">")
+                   + pad("%.0f" % vram.get("logic_ceiling_gib", 0.0), 13, ">"))
     out.append("")
     good = [r for r in reports if not r.get("error")]
     if good:
@@ -826,17 +942,26 @@ def render_summary(reports):
     out.append("  读取成功 %d / 共 %d 张。" % (ok, len(reports)))
     out.append("")
     out.append("  ⚠ 这些数字都是按缺陷标记折算的估算值，不是实测上限；本脚本没有启用、")
-    out.append("    也没有测试任何停用 SM 或隐藏显存，全程只读。")
-    out.append("═" * 78)
+    out.append("    也没有测试任何停用 SM 或隐藏显存，全程只读。显存的物理天花板是板载")
+    out.append("    HBM 颗粒数，寄存器读不出来——所以\"逻辑上限\"只是条件性候选。")
+    out.append("═" * 92)
     return "\n".join(out)
 
 
-def render_header(reports, args):
+def render_header(reports, args, meta=None):
     now = datetime.datetime.now().astimezone()
+    meta = meta or {}
+    host = meta.get("host") or socket.gethostname()
+    kernel = meta.get("kernel") or platform.release()
+    when = meta.get("generated")
+    if when:
+        stamp = "%s（离线重渲染，原采集时间）" % when
+    else:
+        stamp = now.strftime("%Y-%m-%d %H:%M:%S %Z")
     out = ["=" * 78,
            " CMP 170HX 解锁上限只读自查  v%s" % VERSION,
-           " 主机 %s   时间 %s" % (socket.gethostname(), now.strftime("%Y-%m-%d %H:%M:%S %Z")),
-           " 内核 %s   发现 %d 张受支持的卡" % (platform.release(), len(reports)),
+           " 主机 %s   时间 %s" % (host, stamp),
+           " 内核 %s   发现 %d 张受支持的卡" % (kernel, len(reports)),
            " 访问路径 /sys/bus/pci/devices/<BDF>/resource0（O_RDONLY + PROT_READ）",
            " 本脚本不写 GPU、不写 PCI 配置、不发 fuse 命令、不做任何解锁动作",
            "=" * 78]
@@ -884,9 +1009,11 @@ def platform_error():
 
 
 def upgrade_report(report):
-    """兼容旧版 JSON（只有索引列表、没有 SM/显存折算）：重建掩码后重跑 interpret()。"""
+    """兼容旧版 JSON（缺 SM 或 HBM 位点折算）：重建掩码后重跑 interpret()。"""
     interp = report.get("interpretation")
-    if not interp or "sm" in interp:
+    if not interp:
+        return report
+    if "sm" in interp and "site_breakdown" in (interp.get("vram") or {}):
         return report
     values = {}
     try:
@@ -926,9 +1053,10 @@ def load_render_input(path_text):
     with open(path_text, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     if isinstance(data, dict) and "cards" in data:
-        return [upgrade_report(card) for card in data["cards"]]
+        meta = {k: data.get(k) for k in ("host", "kernel", "generated", "script_version")}
+        return [upgrade_report(card) for card in data["cards"]], meta
     if isinstance(data, dict) and "target" in data:
-        return [upgrade_report(data)]
+        return [upgrade_report(data)], {}
     raise SystemExit("这个 JSON 不是本脚本产出的格式：%s" % path_text)
 
 
@@ -954,8 +1082,8 @@ def main(argv=None):
 
     # ---- 离线渲染模式 ----
     if args.render:
-        reports = load_render_input(args.render)
-        text = "\n".join([render_header(reports, args)]
+        reports, meta = load_render_input(args.render)
+        text = "\n".join([render_header(reports, args, meta)]
                          + [render_card(r, i, len(reports), args.regs)
                             for i, r in enumerate(reports)]
                          + [render_summary(reports)])
